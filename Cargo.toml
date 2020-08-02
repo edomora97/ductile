@@ -3,6 +3,13 @@ name = "ductile"
 version = "0.1.0"
 authors = ["Edoardo Morassutto <edoardo.morassutto@gmail.com>"]
 edition = "2018"
+license = "MIT"
+description = "A channel implementation that allows both local in-memory channels and remote TCP-based channels with the same interface."
+homepage = "https://github.com/edomora97/ductile"
+repository = "https://github.com/edomora97/ductile"
+keywords = ["channel", "actor", "network"]
+categories = ["concurrency", "network-programming"]
+readme = "README.md"
 
 [dependencies]
 crossbeam-channel = "0.4"

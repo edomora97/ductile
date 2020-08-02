@@ -1,5 +1,10 @@
 # ductile
 
+[![Rust](https://github.com/edomora97/ductile/workflows/Rust/badge.svg?branch=master)](https://github.com/edomora97/ductile/actions?query=workflow%3ARust)
+[![Audit](https://github.com/edomora97/ductile/workflows/Audit/badge.svg?branch=master)](https://github.com/edomora97/ductile/actions?query=workflow%3AAudit)
+[![crates.io](https://img.shields.io/crates/v/ductile.svg)](https://crates.io/crates/ductile)
+[![Docs](https://docs.rs/ductile/badge.svg)](https://docs.rs/ductile)
+
 A channel implementation that allows both local in-memory channels and remote TCP-based channels
 with the same interface.
 
