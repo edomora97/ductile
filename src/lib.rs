@@ -159,7 +159,7 @@
 //! For unencrytpted channels the same handshake is done but with a static key and nonce and only
 //! the magic is encrypted. All the following messages will be sent unencrypted.
 #![deny(missing_docs)]
-#![deny(missing_doc_code_examples)]
+#![deny(rustdoc::missing_doc_code_examples)]
 
 #[macro_use]
 extern crate log;
@@ -309,7 +309,7 @@ where
                     stream,
                     ChannelMessage::RawDataStart(data.len()),
                 )?;
-                Ok(stream.write_all(&data)?)
+                Ok(stream.write_all(data)?)
             }
             ChannelSenderInner::RemoteEnc(stream) => {
                 let mut stream = stream.lock().unwrap();
@@ -677,10 +677,10 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                         }
                     };
                     let enc_nonce = Nonce::from_slice(&enc_nonce);
-                    let mut enc = ChaCha20::new(&key, &enc_nonce);
+                    let mut enc = ChaCha20::new(key, enc_nonce);
 
                     let dec_nonce = Nonce::from_slice(&dec_nonce);
-                    let mut dec = ChaCha20::new(&key, &dec_nonce);
+                    let mut dec = ChaCha20::new(key, dec_nonce);
 
                     // the last part of the handshake checks that the encryption key is correct
                     if let Err(e) = check_encryption_key(&mut sender, &mut enc, &mut dec) {
@@ -792,8 +792,8 @@ pub fn connect_channel_with_enc<A: ToSocketAddrs, S, R>(
 
     let (enc_nonce, dec_nonce) = nonce_handshake(&mut stream)?;
     let key = Key::from_slice(enc_key);
-    let mut enc = ChaCha20::new(&key, &Nonce::from_slice(&enc_nonce));
-    let mut dec = ChaCha20::new(&key, &Nonce::from_slice(&dec_nonce));
+    let mut enc = ChaCha20::new(key, Nonce::from_slice(&enc_nonce));
+    let mut dec = ChaCha20::new(key, Nonce::from_slice(&dec_nonce));
 
     check_encryption_key(&mut stream, &mut enc, &mut dec)?;
 
