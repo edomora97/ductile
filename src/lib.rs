@@ -171,10 +171,10 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
+use anyhow::{bail, Error};
 use chacha20::stream_cipher::{NewStreamCipher, SyncStreamCipher};
 use chacha20::{ChaCha20, Key, Nonce};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use failure::{bail, Error};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
