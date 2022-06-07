@@ -172,7 +172,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Error};
-use chacha20::stream_cipher::{NewStreamCipher, SyncStreamCipher};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20, Key, Nonce};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use rand::rngs::OsRng;
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_remote_channels_enc_wrong_key() {
-        let port = rand::thread_rng().gen_range(10000u16, 20000u16);
+        let port = rand::thread_rng().gen_range(10000u16..20000u16);
         let enc_key = [42u8; 32];
         let mut server: ChannelServer<(), ()> =
             ChannelServer::bind_with_enc(("127.0.0.1", port), enc_key).unwrap();
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_remote_channels_enc_no_key() {
-        let port = rand::thread_rng().gen_range(10000u16, 20000u16);
+        let port = rand::thread_rng().gen_range(10000u16..20000u16);
         let enc_key = [42u8; 32];
         let mut server: ChannelServer<(), ()> =
             ChannelServer::bind_with_enc(("127.0.0.1", port), enc_key).unwrap();
@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_remote_channels_receiver_stops() {
-        let port = rand::thread_rng().gen_range(10000u16, 20000u16);
+        let port = rand::thread_rng().gen_range(10000u16..20000u16);
         let mut server: ChannelServer<(), ()> = ChannelServer::bind(("127.0.0.1", port)).unwrap();
 
         let client_thread = std::thread::spawn(move || {
