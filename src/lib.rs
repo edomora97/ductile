@@ -659,8 +659,15 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                 .expect("TcpListener::incoming returned None");
             // `next` is Err if a client connected only partially
             if let Ok(mut sender) = next {
-                // it is required for all the clients to have a proper SocketAddr
-                let peer_addr = sender.peer_addr().expect("Peer has no remote address");
+                // it is required for all the clients to have a proper SocketAddr, but
+                // a client might be already disconnected
+                let peer_addr = match sender.peer_addr() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!("Peer has no remote address: {}", e);
+                        continue;
+                    }
+                };
                 // it is required that the sockets are clonable for splitting them into
                 // sender/receiver
                 let receiver = sender.try_clone().expect("Failed to clone the stream");
