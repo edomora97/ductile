@@ -5,14 +5,14 @@
 [![crates.io](https://img.shields.io/crates/v/ductile.svg)](https://crates.io/crates/ductile)
 [![Docs](https://docs.rs/ductile/badge.svg)](https://docs.rs/ductile)
 
-A channel implementation that allows both local in-memory channels and remote TCP-based channels
-with the same interface.
+A channel implementation that allows both local in-memory channels and remote TCP-based/Unix
+channels with the same interface.
 
 ## Components
 
 This crate exposes an interface similar to `std::sync::mpsc` channels. It provides a multiple
 producers, single consumer channel that can use under the hood local in-memory channels
-(provided by `crossbeam_channel`) but also network channels via TCP sockets. The remote
+(provided by `crossbeam_channel`) but also network channels via TCP/Unix sockets. The remote
 connection can also be encrypted using ChaCha20.
 
 Like `std::sync::mpsc`, there could be more `ChannelSender` but there can be only one

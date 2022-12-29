@@ -3,14 +3,14 @@
 //! [![crates.io](https://img.shields.io/crates/v/ductile.svg)](https://crates.io/crates/ductile)
 //! [![Docs](https://docs.rs/ductile/badge.svg)](https://docs.rs/ductile)
 //!
-//! A channel implementation that allows both local in-memory channels and remote TCP-based channels
-//! with the same interface.
+//! A channel implementation that allows both local in-memory channels and remote TCP-based/Unix
+//! channels with the same interface.
 //!
 //! # Components
 //!
 //! This crate exposes an interface similar to `std::sync::mpsc` channels. It provides a multiple
 //! producers, single consumer channel that can use under the hood local in-memory channels
-//! (provided by `crossbeam_channel`) but also network channels via TCP sockets. The remote
+//! (provided by `crossbeam_channel`) but also network channels via TCP/Unix sockets. The remote
 //! connection can also be encrypted using ChaCha20.
 //!
 //! Like `std::sync::mpsc`, there could be more `ChannelSender` but there can be only one
@@ -167,7 +167,9 @@ use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::ops::{Deref, DerefMut};
+use std::ops::DerefMut;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Error};
@@ -219,13 +221,15 @@ enum ChannelSenderInner<T> {
     /// The connection is with a remote party. The Arc<Mutex<>> is needed because TcpStream is not
     /// Clone and sending concurrently is not safe.
     Remote(Arc<Mutex<TcpStream>>),
+    /// The connection is with a unix socket.
+    Unix(Arc<Mutex<UnixStream>>),
     /// The connection is with a remote party, encrypted with ChaCha20.
     RemoteEnc(Arc<Mutex<(TcpStream, ChaCha20)>>),
 }
 
 /// The channel part that sends data. It is generic over the type of messages sent and abstracts the
 /// underlying type of connection. The connection type can be local in memory, or remote using TCP
-/// sockets.
+/// sockets or local with Unix sockets.
 ///
 /// This sender is Clone since the channel is multiple producers, single consumer, just like
 /// `std::sync::mpsc`.
@@ -240,6 +244,8 @@ enum ChannelReceiverInner<T> {
     Local(Receiver<ChannelMessage<T>>),
     /// The connection is with a remote party over a TCP socket.
     Remote(RefCell<TcpStream>),
+    /// The connection is with a unix socket.
+    Unix(RefCell<UnixStream>),
     /// The connection is with a remote party and it is encrypted using ChaCha20.
     RemoteEnc(RefCell<(TcpStream, ChaCha20)>),
 }
@@ -284,6 +290,11 @@ where
                 let stream = sender.deref_mut();
                 ChannelSender::<T>::send_remote_raw(stream, ChannelMessage::Message(data))
             }
+            ChannelSenderInner::Unix(stream) => {
+                let mut sender = stream.lock().unwrap();
+                let stream = sender.deref_mut();
+                ChannelSender::<T>::send_unix_raw(stream, ChannelMessage::Message(data))
+            }
             ChannelSenderInner::RemoteEnc(stream) => {
                 let mut stream = stream.lock().unwrap();
                 let (stream, enc) = stream.deref_mut();
@@ -320,6 +331,15 @@ where
                 )?;
                 Ok(stream.write_all(data)?)
             }
+            ChannelSenderInner::Unix(sender) => {
+                let mut sender = sender.lock().expect("Cannot lock ChannelSender");
+                let stream = sender.deref_mut();
+                ChannelSender::<T>::send_unix_raw(
+                    stream,
+                    ChannelMessage::RawDataStart(data.len()),
+                )?;
+                Ok(stream.write_all(data)?)
+            }
             ChannelSenderInner::RemoteEnc(stream) => {
                 let mut stream = stream.lock().unwrap();
                 let (stream, enc) = stream.deref_mut();
@@ -337,6 +357,11 @@ where
     /// Serialize and send a `ChannelMessage` data to the remote channel, without encrypting
     /// message.
     fn send_remote_raw(stream: &mut TcpStream, data: ChannelMessage<T>) -> Result<()> {
+        Ok(bincode::serialize_into(stream, &data)?)
+    }
+
+    /// Serialize and send a `ChannelMessage` data to the unix channel.
+    fn send_unix_raw(stream: &mut UnixStream, data: ChannelMessage<T>) -> Result<()> {
         Ok(bincode::serialize_into(stream, &data)?)
     }
 
@@ -369,9 +394,9 @@ where
     ///
     /// ```
     /// # use ductile::{ChannelServer, connect_channel, ChannelSender};
-    /// # let server = ChannelServer::<i32, i32>::bind("127.0.0.1:12358").unwrap();
+    /// # let server = ChannelServer::<i32, i32>::bind("127.0.0.1:12359").unwrap();
     /// # let thread = std::thread::spawn(move || {
-    /// #    let (sender, receiver) = connect_channel::<_, i32, i32>("127.0.0.1:12358").unwrap();
+    /// #    let (sender, receiver) = connect_channel::<_, i32, i32>("127.0.0.1:12359").unwrap();
     /// #    assert_eq!(receiver.recv().unwrap(), 42i32);
     /// #    sender.send(69i32).unwrap();
     /// let sender: ChannelSender<i32> = sender.change_type();
@@ -388,6 +413,9 @@ where
         match self.inner {
             ChannelSenderInner::Remote(r) => ChannelSender {
                 inner: ChannelSenderInner::Remote(r),
+            },
+            ChannelSenderInner::Unix(r) => ChannelSender {
+                inner: ChannelSenderInner::Unix(r),
             },
             ChannelSenderInner::RemoteEnc(r) => ChannelSender {
                 inner: ChannelSenderInner::RemoteEnc(r),
@@ -417,6 +445,7 @@ where
         let message = match &self.inner {
             ChannelReceiverInner::Local(receiver) => receiver.recv()?,
             ChannelReceiverInner::Remote(receiver) => ChannelReceiver::recv_remote_raw(receiver)?,
+            ChannelReceiverInner::Unix(receiver) => ChannelReceiver::recv_unix_raw(receiver)?,
             ChannelReceiverInner::RemoteEnc(receiver) => {
                 let mut receiver = receiver.borrow_mut();
                 let (receiver, decryptor) = receiver.deref_mut();
@@ -462,6 +491,17 @@ where
                     _ => panic!("Expected ChannelMessage::RawDataStart"),
                 }
             }
+            ChannelReceiverInner::Unix(receiver) => {
+                match ChannelReceiver::<T>::recv_unix_raw(receiver)? {
+                    ChannelMessage::RawDataStart(len) => {
+                        let mut receiver = receiver.borrow_mut();
+                        let mut buf = vec![0u8; len];
+                        receiver.read_exact(&mut buf)?;
+                        Ok(buf)
+                    }
+                    _ => panic!("Expected ChannelMessage::RawDataStart"),
+                }
+            }
             ChannelReceiverInner::RemoteEnc(receiver) => {
                 let mut receiver = receiver.borrow_mut();
                 let (receiver, decryptor) = receiver.deref_mut();
@@ -478,6 +518,12 @@ where
 
     /// Receive a message from the TCP stream of a channel.
     fn recv_remote_raw(receiver: &RefCell<TcpStream>) -> Result<ChannelMessage<T>> {
+        let mut receiver = receiver.borrow_mut();
+        Ok(bincode::deserialize_from(receiver.deref_mut())?)
+    }
+
+    /// Receive a message from the unix stream of a channel.
+    fn recv_unix_raw(receiver: &RefCell<UnixStream>) -> Result<ChannelMessage<T>> {
         let mut receiver = receiver.borrow_mut();
         Ok(bincode::deserialize_from(receiver.deref_mut())?)
     }
@@ -535,6 +581,9 @@ where
             ChannelReceiverInner::Remote(r) => ChannelReceiver {
                 inner: ChannelReceiverInner::Remote(r),
             },
+            ChannelReceiverInner::Unix(r) => ChannelReceiver {
+                inner: ChannelReceiverInner::Unix(r),
+            },
             ChannelReceiverInner::RemoteEnc(r) => ChannelReceiver {
                 inner: ChannelReceiverInner::RemoteEnc(r),
             },
@@ -566,15 +615,15 @@ pub fn new_local_channel<T>() -> (ChannelSender<T>, ChannelReceiver<T>) {
     )
 }
 
-/// Listener for connections on some TCP socket.
+/// Listener for connections on some TCP or unix socket.
 ///
 /// The connection between the two parts is full-duplex and the types of message shared can be
 /// different. `S` and `R` are the types of message sent and received respectively. When initialized
 /// with an encryption key it is expected that the remote clients use the same key. Clients that use
 /// the wrong key are disconnected during an initial handshake.
 pub struct ChannelServer<S, R> {
-    /// The actual listener of the TCP socket.
-    listener: TcpListener,
+    /// The actual listener of the socket.
+    listener: Listener,
     /// An optional ChaCha20 key to use to encrypt the communication.
     enc_key: Option<[u8; 32]>,
     /// Save the type of the sending messages.
@@ -583,9 +632,68 @@ pub struct ChannelServer<S, R> {
     _receiver: PhantomData<*const R>,
 }
 
+/// A server implementation, which can be either TCP or Unix socket.
+enum Listener {
+    /// This listener is a TCP socket.
+    Tcp(TcpListener),
+    /// This listener is a unix socket.
+    Unix(UnixListener),
+}
+
+/// A client that can be either TCP or Unix.
+enum ClientSocket {
+    /// The client is TCP.
+    Tcp(TcpStream),
+    /// The client is unix.
+    Unix(UnixStream),
+}
+
+impl Listener {
+    /// Wait for the next client to connect.
+    fn next_client(&mut self) -> Option<ClientSocket> {
+        match self {
+            Self::Tcp(tcp) => loop {
+                if let Ok(client) = tcp.incoming().next()? {
+                    return Some(ClientSocket::Tcp(client));
+                }
+            },
+            Self::Unix(unix) => loop {
+                if let Ok(client) = unix.incoming().next()? {
+                    return Some(ClientSocket::Unix(client));
+                }
+            },
+        }
+    }
+}
+
 impl<S, R> ChannelServer<S, R> {
-    /// Bind a TCP socket and create a new `ChannelServer`. Only proper sockets are supported (not
-    /// Unix sockets yet). This method does not enable message encryption.
+    /// Get the local address of this socket. If this binds to a unix socket, this returns
+    /// `Ok(None)`.
+    ///
+    /// ```
+    /// # use ductile::ChannelServer;
+    /// # use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    /// let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12359));
+    /// let server = ChannelServer::<i32, i32>::bind(addr).unwrap();
+    /// assert_eq!(server.local_addr().unwrap(), Some(addr));
+    /// ```
+    ///
+    /// ```
+    /// # use ductile::ChannelServer;
+    /// let file = tempfile::NamedTempFile::new().unwrap();
+    /// let path = file.path().to_path_buf();
+    /// let server = ChannelServer::<i32, i32>::bind_unix(path).unwrap();
+    /// assert_eq!(server.local_addr().unwrap(), None);
+    /// ```
+    pub fn local_addr(&self) -> Result<Option<SocketAddr>> {
+        match &self.listener {
+            Listener::Tcp(tcp) => Ok(Some(tcp.local_addr()?)),
+            Listener::Unix(_) => Ok(None),
+        }
+    }
+
+    /// Bind a TCP socket and create a new `ChannelServer`. This method does not enable message
+    /// encryption.
     ///
     /// ```
     /// # use ductile::{ChannelServer, connect_channel};
@@ -608,7 +716,43 @@ impl<S, R> ChannelServer<S, R> {
     /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<ChannelServer<S, R>> {
         Ok(ChannelServer {
-            listener: TcpListener::bind(addr)?,
+            listener: Listener::Tcp(TcpListener::bind(addr)?),
+            enc_key: None,
+            _sender: Default::default(),
+            _receiver: Default::default(),
+        })
+    }
+
+    /// Bind a unix socket and create a new `ChannelServer`. This method does not support message encryption.
+    ///
+    /// ```
+    /// # use ductile::{ChannelServer, connect_unix_channel};
+    /// let file = tempfile::NamedTempFile::new().unwrap();
+    /// let path = file.path().to_path_buf();
+    /// let server = ChannelServer::<i32, i32>::bind_unix(&path).unwrap();
+    ///
+    /// # let thread =
+    /// std::thread::spawn(move || {
+    ///     let (sender, receiver) = connect_unix_channel::<_, i32, i32>(&path).unwrap();
+    ///     assert_eq!(receiver.recv().unwrap(), 42i32);
+    ///     sender.send(69i32).unwrap();
+    /// });
+    ///
+    /// for (sender, receiver, address) in server {
+    ///     sender.send(42i32).unwrap();
+    ///     assert_eq!(receiver.recv().unwrap(), 69i32);
+    /// #   break;
+    /// }
+    /// # thread.join().unwrap();
+    /// ```
+    pub fn bind_unix<P: AsRef<Path>>(path: P) -> Result<ChannelServer<S, R>> {
+        let path = path.as_ref();
+        // We cannot bind to an existing file.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(ChannelServer {
+            listener: Listener::Unix(UnixListener::bind(path)?),
             enc_key: None,
             _sender: Default::default(),
             _receiver: Default::default(),
@@ -644,7 +788,7 @@ impl<S, R> ChannelServer<S, R> {
         enc_key: [u8; 32],
     ) -> Result<ChannelServer<S, R>> {
         Ok(ChannelServer {
-            listener: TcpListener::bind(addr)?,
+            listener: Listener::Tcp(TcpListener::bind(addr)?),
             enc_key: Some(enc_key),
             _sender: Default::default(),
             _receiver: Default::default(),
@@ -652,88 +796,100 @@ impl<S, R> ChannelServer<S, R> {
     }
 }
 
-impl<S, R> Deref for ChannelServer<S, R> {
-    type Target = TcpListener;
-
-    fn deref(&self) -> &Self::Target {
-        &self.listener
-    }
-}
-
 impl<S, R> Iterator for ChannelServer<S, R> {
-    type Item = (ChannelSender<S>, ChannelReceiver<R>, SocketAddr);
+    type Item = (ChannelSender<S>, ChannelReceiver<R>, Option<SocketAddr>);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let next = self
                 .listener
-                .incoming()
-                .next()
+                .next_client()
                 .expect("TcpListener::incoming returned None");
-            // `next` is Err if a client connected only partially
-            if let Ok(mut sender) = next {
-                // it is required for all the clients to have a proper SocketAddr, but
-                // a client might be already disconnected
-                let peer_addr = match sender.peer_addr() {
-                    Ok(x) => x,
-                    Err(e) => {
-                        warn!("Peer has no remote address: {}", e);
-                        continue;
-                    }
-                };
-                // it is required that the sockets are clonable for splitting them into
-                // sender/receiver
-                let receiver = sender.try_clone().expect("Failed to clone the stream");
-                // if the encryption key was provided do the handshake using it
-                if let Some(enc_key) = &self.enc_key {
-                    let key = Key::from_slice(enc_key);
-
-                    // generate and exchange new random nonce
-                    let (enc_nonce, dec_nonce) = match nonce_handshake(&mut sender) {
+            match next {
+                ClientSocket::Tcp(mut sender) => {
+                    // it is required for all the clients to have a proper SocketAddr, but
+                    // a client might be already disconnected
+                    let peer_addr = match sender.peer_addr() {
                         Ok(x) => x,
                         Err(e) => {
-                            warn!("Nonce handshake failed with {}: {:?}", peer_addr, e);
+                            warn!("Peer has no remote address: {}", e);
                             continue;
                         }
                     };
-                    let enc_nonce = Nonce::from_slice(&enc_nonce);
-                    let mut enc = ChaCha20::new(key, enc_nonce);
+                    // it is required that the sockets are clonable for splitting them into
+                    // sender/receiver
+                    let mut receiver = sender.try_clone().expect("Failed to clone the stream");
+                    // if the encryption key was provided do the handshake using it
+                    if let Some(enc_key) = &self.enc_key {
+                        let key = Key::from_slice(enc_key);
 
-                    let dec_nonce = Nonce::from_slice(&dec_nonce);
-                    let mut dec = ChaCha20::new(key, dec_nonce);
+                        // generate and exchange new random nonce
+                        let (enc_nonce, dec_nonce) = match nonce_handshake(&mut sender) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                warn!("Nonce handshake failed with {}: {:?}", peer_addr, e);
+                                continue;
+                            }
+                        };
+                        let enc_nonce = Nonce::from_slice(&enc_nonce);
+                        let mut enc = ChaCha20::new(key, enc_nonce);
 
-                    // the last part of the handshake checks that the encryption key is correct
-                    if let Err(e) = check_encryption_key(&mut sender, &mut enc, &mut dec) {
-                        warn!("Magic handshake failed with {}: {:?}", peer_addr, e);
+                        let dec_nonce = Nonce::from_slice(&dec_nonce);
+                        let mut dec = ChaCha20::new(key, dec_nonce);
+
+                        // the last part of the handshake checks that the encryption key is correct
+                        if let Err(e) =
+                            check_encryption_key(&mut sender, &mut receiver, &mut enc, &mut dec)
+                        {
+                            warn!("Magic handshake failed with {}: {:?}", peer_addr, e);
+                            continue;
+                        }
+
+                        return Some((
+                            ChannelSender {
+                                inner: ChannelSenderInner::RemoteEnc(Arc::new(Mutex::new((
+                                    sender, enc,
+                                )))),
+                            },
+                            ChannelReceiver {
+                                inner: ChannelReceiverInner::RemoteEnc(RefCell::new((
+                                    receiver, dec,
+                                ))),
+                            },
+                            Some(peer_addr),
+                        ));
+                    // if no key was provided the handshake checks that the other end also didn't use an
+                    // encryption key
+                    } else {
+                        if let Err(e) = check_no_encryption(&mut sender, &mut receiver) {
+                            warn!("Magic handshake failed with {}: {:?}", peer_addr, e);
+                            continue;
+                        }
+                        return Some((
+                            ChannelSender {
+                                inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(sender))),
+                            },
+                            ChannelReceiver {
+                                inner: ChannelReceiverInner::Remote(RefCell::new(receiver)),
+                            },
+                            Some(peer_addr),
+                        ));
+                    }
+                }
+                ClientSocket::Unix(mut sender) => {
+                    let mut receiver = sender.try_clone().expect("Failed to clone the stream");
+                    if let Err(e) = check_no_encryption(&mut sender, &mut receiver) {
+                        warn!("Magic handshake failed with local client: {:?}", e);
                         continue;
                     }
-
                     return Some((
                         ChannelSender {
-                            inner: ChannelSenderInner::RemoteEnc(Arc::new(Mutex::new((
-                                sender, enc,
-                            )))),
+                            inner: ChannelSenderInner::Unix(Arc::new(Mutex::new(sender))),
                         },
                         ChannelReceiver {
-                            inner: ChannelReceiverInner::RemoteEnc(RefCell::new((receiver, dec))),
+                            inner: ChannelReceiverInner::Unix(RefCell::new(receiver)),
                         },
-                        peer_addr,
-                    ));
-                // if no key was provided the handshake checks that the other end also didn't use an
-                // encryption key
-                } else {
-                    if let Err(e) = check_no_encryption(&mut sender) {
-                        warn!("Magic handshake failed with {}: {:?}", peer_addr, e);
-                        continue;
-                    }
-                    return Some((
-                        ChannelSender {
-                            inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(sender))),
-                        },
-                        ChannelReceiver {
-                            inner: ChannelReceiverInner::Remote(RefCell::new(receiver)),
-                        },
-                        peer_addr,
+                        None,
                     ));
                 }
             }
@@ -764,19 +920,59 @@ impl<S, R> Iterator for ChannelServer<S, R> {
 /// assert_eq!(data, vec![1, 2, 3, 4]);
 /// # client_thread.join().unwrap();
 /// ```
-
 pub fn connect_channel<A: ToSocketAddrs, S, R>(
     addr: A,
 ) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
     let mut stream = TcpStream::connect(addr)?;
-    let stream2 = stream.try_clone()?;
-    check_no_encryption(&mut stream)?;
+    let mut stream2 = stream.try_clone()?;
+    check_no_encryption(&mut stream, &mut stream2)?;
     Ok((
         ChannelSender {
             inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(stream))),
         },
         ChannelReceiver {
             inner: ChannelReceiverInner::Remote(RefCell::new(stream2)),
+        },
+    ))
+}
+
+/// Connect to a remote channel.
+///
+/// All the remote channels are full-duplex, therefore this function returns a channel for sending
+/// the message and a channel from where receive them.
+///
+/// This function will no enable message encryption.
+///
+/// ```
+/// # use ductile::{ChannelServer, connect_unix_channel};
+/// let file = tempfile::NamedTempFile::new().unwrap();
+/// let path = file.path().to_path_buf();
+/// let mut server = ChannelServer::<(), _>::bind_unix(&path).unwrap();
+///
+/// let client_thread = std::thread::spawn(move || {
+///     let (sender, receiver) = connect_unix_channel::<_, _, ()>(&path).unwrap();
+///
+///     sender.send(vec![1, 2, 3, 4]).unwrap();
+/// });
+///
+/// let (sender, receiver, _addr) = server.next().unwrap();
+/// let data: Vec<i32> = receiver.recv().unwrap();
+/// assert_eq!(data, vec![1, 2, 3, 4]);
+/// # client_thread.join().unwrap();
+/// ```
+pub fn connect_unix_channel<P: AsRef<Path>, S, R>(
+    path: P,
+) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
+    let path = path.as_ref();
+    let mut stream = UnixStream::connect(path)?;
+    let mut stream2 = stream.try_clone()?;
+    check_no_encryption(&mut stream, &mut stream2)?;
+    Ok((
+        ChannelSender {
+            inner: ChannelSenderInner::Unix(Arc::new(Mutex::new(stream))),
+        },
+        ChannelReceiver {
+            inner: ChannelReceiverInner::Unix(RefCell::new(stream2)),
         },
     ))
 }
@@ -808,14 +1004,14 @@ pub fn connect_channel_with_enc<A: ToSocketAddrs, S, R>(
     enc_key: &[u8; 32],
 ) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
     let mut stream = TcpStream::connect(addr)?;
-    let stream2 = stream.try_clone()?;
+    let mut stream2 = stream.try_clone()?;
 
     let (enc_nonce, dec_nonce) = nonce_handshake(&mut stream)?;
     let key = Key::from_slice(enc_key);
     let mut enc = ChaCha20::new(key, Nonce::from_slice(&enc_nonce));
     let mut dec = ChaCha20::new(key, Nonce::from_slice(&dec_nonce));
 
-    check_encryption_key(&mut stream, &mut enc, &mut dec)?;
+    check_encryption_key(&mut stream, &mut stream2, &mut enc, &mut dec)?;
 
     Ok((
         ChannelSender {
@@ -842,16 +1038,17 @@ fn nonce_handshake(s: &mut TcpStream) -> Result<([u8; 12], [u8; 12])> {
 
 /// Check that the encryption key is the same both ends.
 fn check_encryption_key(
-    stream: &mut TcpStream,
+    sender: &mut dyn Write,
+    receiver: &mut dyn Read,
     enc: &mut ChaCha20,
     dec: &mut ChaCha20,
 ) -> Result<()> {
     let mut magic = MAGIC.to_le_bytes();
     enc.apply_keystream(&mut magic);
-    stream.write_all(&magic)?;
-    stream.flush()?;
+    sender.write_all(&magic)?;
+    sender.flush()?;
 
-    stream.read_exact(&mut magic)?;
+    receiver.read_exact(&mut magic)?;
     dec.apply_keystream(&mut magic);
     let magic = u32::from_le_bytes(magic);
     if magic != MAGIC {
@@ -861,12 +1058,12 @@ fn check_encryption_key(
 }
 
 /// Check that no encryption is used by the other end.
-fn check_no_encryption(stream: &mut TcpStream) -> Result<()> {
+fn check_no_encryption(sender: &mut dyn Write, receiver: &mut dyn Read) -> Result<()> {
     let key = b"task-maker's the best thing ever";
     let nonce = b"task-maker!!";
     let mut enc = ChaCha20::new(Key::from_slice(key), Nonce::from_slice(nonce));
     let mut dec = ChaCha20::new(Key::from_slice(key), Nonce::from_slice(nonce));
-    check_encryption_key(stream, &mut enc, &mut dec)
+    check_encryption_key(sender, receiver, &mut enc, &mut dec)
 }
 
 #[cfg(test)]
