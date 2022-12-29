@@ -164,7 +164,7 @@
 extern crate log;
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::ops::DerefMut;
@@ -220,11 +220,11 @@ enum ChannelSenderInner<T> {
     Local(Sender<ChannelMessage<T>>),
     /// The connection is with a remote party. The Arc<Mutex<>> is needed because TcpStream is not
     /// Clone and sending concurrently is not safe.
-    Remote(Arc<Mutex<TcpStream>>),
+    Remote(Arc<Mutex<BufWriter<TcpStream>>>),
     /// The connection is with a unix socket.
-    Unix(Arc<Mutex<UnixStream>>),
+    Unix(Arc<Mutex<BufWriter<UnixStream>>>),
     /// The connection is with a remote party, encrypted with ChaCha20.
-    RemoteEnc(Arc<Mutex<(TcpStream, ChaCha20)>>),
+    RemoteEnc(Arc<Mutex<(BufWriter<TcpStream>, ChaCha20)>>),
 }
 
 /// The channel part that sends data. It is generic over the type of messages sent and abstracts the
@@ -243,11 +243,11 @@ enum ChannelReceiverInner<T> {
     /// The connection is only a local in-memory channel.
     Local(Receiver<ChannelMessage<T>>),
     /// The connection is with a remote party over a TCP socket.
-    Remote(RefCell<TcpStream>),
+    Remote(RefCell<BufReader<TcpStream>>),
     /// The connection is with a unix socket.
-    Unix(RefCell<UnixStream>),
+    Unix(RefCell<BufReader<UnixStream>>),
     /// The connection is with a remote party and it is encrypted using ChaCha20.
-    RemoteEnc(RefCell<(TcpStream, ChaCha20)>),
+    RemoteEnc(RefCell<(BufReader<TcpStream>, ChaCha20)>),
 }
 
 /// The channel part that receives data. It is generic over the type of messages sent in the
@@ -293,7 +293,7 @@ where
             ChannelSenderInner::Unix(stream) => {
                 let mut sender = stream.lock().unwrap();
                 let stream = sender.deref_mut();
-                ChannelSender::<T>::send_unix_raw(stream, ChannelMessage::Message(data))
+                ChannelSender::<T>::send_remote_raw(stream, ChannelMessage::Message(data))
             }
             ChannelSenderInner::RemoteEnc(stream) => {
                 let mut stream = stream.lock().unwrap();
@@ -329,16 +329,20 @@ where
                     stream,
                     ChannelMessage::RawDataStart(data.len()),
                 )?;
-                Ok(stream.write_all(data)?)
+                stream.write_all(data)?;
+                stream.flush()?;
+                Ok(())
             }
             ChannelSenderInner::Unix(sender) => {
                 let mut sender = sender.lock().expect("Cannot lock ChannelSender");
                 let stream = sender.deref_mut();
-                ChannelSender::<T>::send_unix_raw(
+                ChannelSender::<T>::send_remote_raw(
                     stream,
                     ChannelMessage::RawDataStart(data.len()),
                 )?;
-                Ok(stream.write_all(data)?)
+                stream.write_all(data)?;
+                stream.flush()?;
+                Ok(())
             }
             ChannelSenderInner::RemoteEnc(stream) => {
                 let mut stream = stream.lock().unwrap();
@@ -349,31 +353,31 @@ where
                     ChannelMessage::RawDataStart(data.len()),
                 )?;
                 let data = ChannelSender::<T>::encrypt_buffer(data.into(), enc)?;
-                Ok(stream.write_all(&data)?)
+                stream.write_all(&data)?;
+                stream.flush()?;
+                Ok(())
             }
         }
     }
 
     /// Serialize and send a `ChannelMessage` data to the remote channel, without encrypting
     /// message.
-    fn send_remote_raw(stream: &mut TcpStream, data: ChannelMessage<T>) -> Result<()> {
-        Ok(bincode::serialize_into(stream, &data)?)
-    }
-
-    /// Serialize and send a `ChannelMessage` data to the unix channel.
-    fn send_unix_raw(stream: &mut UnixStream, data: ChannelMessage<T>) -> Result<()> {
-        Ok(bincode::serialize_into(stream, &data)?)
+    fn send_remote_raw(stream: &mut dyn Write, data: ChannelMessage<T>) -> Result<()> {
+        bincode::serialize_into(&mut *stream, &data)?;
+        stream.flush()?;
+        Ok(())
     }
 
     /// Serialize and send a `ChannelMessage` data to the remote channel, encrypting message.
     fn send_remote_raw_enc(
-        stream: &mut TcpStream,
+        stream: &mut dyn Write,
         encryptor: &mut ChaCha20,
         data: ChannelMessage<T>,
     ) -> Result<()> {
         let data = bincode::serialize(&data)?;
         let data = ChannelSender::<T>::encrypt_buffer(data, encryptor)?;
         stream.write_all(&data)?;
+        stream.flush()?;
         Ok(())
     }
 
@@ -517,20 +521,20 @@ where
     }
 
     /// Receive a message from the TCP stream of a channel.
-    fn recv_remote_raw(receiver: &RefCell<TcpStream>) -> Result<ChannelMessage<T>> {
+    fn recv_remote_raw(receiver: &RefCell<BufReader<TcpStream>>) -> Result<ChannelMessage<T>> {
         let mut receiver = receiver.borrow_mut();
         Ok(bincode::deserialize_from(receiver.deref_mut())?)
     }
 
     /// Receive a message from the unix stream of a channel.
-    fn recv_unix_raw(receiver: &RefCell<UnixStream>) -> Result<ChannelMessage<T>> {
+    fn recv_unix_raw(receiver: &RefCell<BufReader<UnixStream>>) -> Result<ChannelMessage<T>> {
         let mut receiver = receiver.borrow_mut();
         Ok(bincode::deserialize_from(receiver.deref_mut())?)
     }
 
     /// Receive a message from the encrypted TCP stream of a channel.
     fn recv_remote_raw_enc(
-        receiver: &mut TcpStream,
+        receiver: &mut dyn Read,
         decryptor: &mut ChaCha20,
     ) -> Result<ChannelMessage<T>> {
         let buf = ChannelReceiver::<T>::decrypt_buffer(receiver, decryptor)?;
@@ -539,7 +543,7 @@ where
 
     /// Receive and decrypt a frame from the stream, removing the header and returning the contained
     /// raw data.
-    fn decrypt_buffer(receiver: &mut TcpStream, decryptor: &mut ChaCha20) -> Result<Vec<u8>> {
+    fn decrypt_buffer(receiver: &mut dyn Read, decryptor: &mut ChaCha20) -> Result<Vec<u8>> {
         let mut len = [0u8; 4];
         receiver.read_exact(&mut len)?;
         decryptor.apply_keystream(&mut len);
@@ -806,7 +810,7 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                 .next_client()
                 .expect("TcpListener::incoming returned None");
             match next {
-                ClientSocket::Tcp(mut sender) => {
+                ClientSocket::Tcp(sender) => {
                     // it is required for all the clients to have a proper SocketAddr, but
                     // a client might be already disconnected
                     let peer_addr = match sender.peer_addr() {
@@ -818,19 +822,22 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                     };
                     // it is required that the sockets are clonable for splitting them into
                     // sender/receiver
-                    let mut receiver = sender.try_clone().expect("Failed to clone the stream");
+                    let receiver = sender.try_clone().expect("Failed to clone the stream");
+                    let mut sender = BufWriter::new(sender);
+                    let mut receiver = BufReader::new(receiver);
                     // if the encryption key was provided do the handshake using it
                     if let Some(enc_key) = &self.enc_key {
                         let key = Key::from_slice(enc_key);
 
                         // generate and exchange new random nonce
-                        let (enc_nonce, dec_nonce) = match nonce_handshake(&mut sender) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                warn!("Nonce handshake failed with {}: {:?}", peer_addr, e);
-                                continue;
-                            }
-                        };
+                        let (enc_nonce, dec_nonce) =
+                            match nonce_handshake(&mut sender, &mut receiver) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    warn!("Nonce handshake failed with {}: {:?}", peer_addr, e);
+                                    continue;
+                                }
+                            };
                         let enc_nonce = Nonce::from_slice(&enc_nonce);
                         let mut enc = ChaCha20::new(key, enc_nonce);
 
@@ -882,6 +889,8 @@ impl<S, R> Iterator for ChannelServer<S, R> {
                         warn!("Magic handshake failed with local client: {:?}", e);
                         continue;
                     }
+                    let sender = BufWriter::new(sender);
+                    let receiver = BufReader::new(receiver);
                     return Some((
                         ChannelSender {
                             inner: ChannelSenderInner::Unix(Arc::new(Mutex::new(sender))),
@@ -923,15 +932,17 @@ impl<S, R> Iterator for ChannelServer<S, R> {
 pub fn connect_channel<A: ToSocketAddrs, S, R>(
     addr: A,
 ) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
-    let mut stream = TcpStream::connect(addr)?;
-    let mut stream2 = stream.try_clone()?;
-    check_no_encryption(&mut stream, &mut stream2)?;
+    let sender = TcpStream::connect(addr)?;
+    let receiver = sender.try_clone()?;
+    let mut sender = BufWriter::new(sender);
+    let mut receiver = BufReader::new(receiver);
+    check_no_encryption(&mut sender, &mut receiver)?;
     Ok((
         ChannelSender {
-            inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(stream))),
+            inner: ChannelSenderInner::Remote(Arc::new(Mutex::new(sender))),
         },
         ChannelReceiver {
-            inner: ChannelReceiverInner::Remote(RefCell::new(stream2)),
+            inner: ChannelReceiverInner::Remote(RefCell::new(receiver)),
         },
     ))
 }
@@ -964,15 +975,17 @@ pub fn connect_unix_channel<P: AsRef<Path>, S, R>(
     path: P,
 ) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
     let path = path.as_ref();
-    let mut stream = UnixStream::connect(path)?;
-    let mut stream2 = stream.try_clone()?;
-    check_no_encryption(&mut stream, &mut stream2)?;
+    let mut sender = UnixStream::connect(path)?;
+    let mut receiver = sender.try_clone()?;
+    check_no_encryption(&mut sender, &mut receiver)?;
+    let sender = BufWriter::new(sender);
+    let receiver = BufReader::new(receiver);
     Ok((
         ChannelSender {
-            inner: ChannelSenderInner::Unix(Arc::new(Mutex::new(stream))),
+            inner: ChannelSenderInner::Unix(Arc::new(Mutex::new(sender))),
         },
         ChannelReceiver {
-            inner: ChannelReceiverInner::Unix(RefCell::new(stream2)),
+            inner: ChannelReceiverInner::Unix(RefCell::new(receiver)),
         },
     ))
 }
@@ -1003,35 +1016,40 @@ pub fn connect_channel_with_enc<A: ToSocketAddrs, S, R>(
     addr: A,
     enc_key: &[u8; 32],
 ) -> Result<(ChannelSender<S>, ChannelReceiver<R>)> {
-    let mut stream = TcpStream::connect(addr)?;
-    let mut stream2 = stream.try_clone()?;
+    let sender = TcpStream::connect(addr)?;
+    let receiver = sender.try_clone()?;
+    let mut sender = BufWriter::new(sender);
+    let mut receiver = BufReader::new(receiver);
 
-    let (enc_nonce, dec_nonce) = nonce_handshake(&mut stream)?;
+    let (enc_nonce, dec_nonce) = nonce_handshake(&mut sender, &mut receiver)?;
     let key = Key::from_slice(enc_key);
     let mut enc = ChaCha20::new(key, Nonce::from_slice(&enc_nonce));
     let mut dec = ChaCha20::new(key, Nonce::from_slice(&dec_nonce));
 
-    check_encryption_key(&mut stream, &mut stream2, &mut enc, &mut dec)?;
+    check_encryption_key(&mut sender, &mut receiver, &mut enc, &mut dec)?;
 
     Ok((
         ChannelSender {
-            inner: ChannelSenderInner::RemoteEnc(Arc::new(Mutex::new((stream, enc)))),
+            inner: ChannelSenderInner::RemoteEnc(Arc::new(Mutex::new((sender, enc)))),
         },
         ChannelReceiver {
-            inner: ChannelReceiverInner::RemoteEnc(RefCell::new((stream2, dec))),
+            inner: ChannelReceiverInner::RemoteEnc(RefCell::new((receiver, dec))),
         },
     ))
 }
 
 /// Send the encryption nonce and receive the decryption nonce using the provided socket.
-fn nonce_handshake(s: &mut TcpStream) -> Result<([u8; 12], [u8; 12])> {
+fn nonce_handshake(
+    sender: &mut dyn Write,
+    receiver: &mut dyn Read,
+) -> Result<([u8; 12], [u8; 12])> {
     let mut enc_nonce = [0u8; 12];
     OsRng.fill_bytes(&mut enc_nonce);
-    s.write_all(&enc_nonce)?;
-    s.flush()?;
+    sender.write_all(&enc_nonce)?;
+    sender.flush()?;
 
     let mut dec_nonce = [0u8; 12];
-    s.read_exact(&mut dec_nonce)?;
+    receiver.read_exact(&mut dec_nonce)?;
 
     Ok((enc_nonce, dec_nonce))
 }
