@@ -8,51 +8,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: clippy
-          override: true
-      - name: Cargo clippy
-        uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-targets --all-features --tests --all -- -D warnings
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --tests --all -- -D warnings
   rustfmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
-      - name: Install Rust
-        id: component
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: rustfmt
-          override: true
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
   readme:
     name: Readme
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
-      - name: Install Rust
-        id: component
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: rustfmt
-          override: true
-      - name: Install cargo-readme
-        uses: actions-rs/cargo@v1
-        with:
-          command: install
-          args: cargo-readme
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo install cargo-readme
+        run: cargo install cargo-readme
       - name: Rebuild readme
         run: ./tools/update-readme.sh
       - name: Check no changes
@@ -63,17 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
-      - name: Install Rust
-        id: component
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          components: rustfmt
-          override: true
-      - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --color=always --all --no-fail-fast
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
         env:
           RUST_BACKTRACE: 1
+        run: cargo test --color=always --all --no-fail-fast
