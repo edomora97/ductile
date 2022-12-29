@@ -159,7 +159,6 @@
 //! For unencrytpted channels the same handshake is done but with a static key and nonce and only
 //! the magic is encrypted. All the following messages will be sent unencrypted.
 #![deny(missing_docs)]
-#![deny(rustdoc::missing_doc_code_examples)]
 
 #[macro_use]
 extern crate log;
@@ -200,6 +199,16 @@ enum ChannelMessage<T> {
     /// data, not the number of bytes sent into the channel. In fact the actual number of bytes sent
     /// is a bit larger (due to encryption overheads that can be eventually removed).
     RawDataStart(usize),
+}
+
+impl<T> ChannelMessage<T> {
+    fn variant(&self) -> &'static str {
+        match self {
+            ChannelMessage::Message(_) => "ChannelMessage::Message",
+            ChannelMessage::RawData(_) => "ChannelMessage::RawData",
+            ChannelMessage::RawDataStart(_) => "ChannelMessage::RawDataStart",
+        }
+    }
 }
 
 /// Actual `ChannelSender` implementation. This exists to hide the variants from the public API.
@@ -416,7 +425,11 @@ where
         };
         match message {
             ChannelMessage::Message(mex) => Ok(mex),
-            _ => panic!("Expected ChannelMessage::Message"),
+            ChannelMessage::RawData(data) => panic!("RawData {:?}", data),
+            _ => panic!(
+                "Expected ChannelMessage::Message, got {}",
+                message.variant()
+            ),
         }
     }
 
